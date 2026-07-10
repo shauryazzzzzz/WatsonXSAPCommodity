@@ -1,0 +1,6 @@
+{
+  "name": "SAP Commodity Risk Dashboard",
+  "description": "Correlate SAP Material Master data (BOMs, vendors) with global commodity exchange prices (Copper, Steel, Aluminum) to analyze financial risk exposure and get AI-driven procurement advice.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
