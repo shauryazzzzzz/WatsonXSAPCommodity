@@ -8,7 +8,7 @@ interface SimulationControlsProps {
   commodities: CommodityMarket[];
   rates: { copper: number; steel: number; aluminum: number; nickel: number };
   onRateChange: (rates: { copper: number; steel: number; aluminum: number; nickel: number }) => void;
-  industry?: "automobile" | "pharma" | "retail";
+  industry?: string;
 }
 
 export default function SimulationControls({
@@ -21,17 +21,9 @@ export default function SimulationControls({
 
   // Dynamic names
   const getCommodityName = (id: "copper" | "steel" | "aluminum" | "nickel") => {
-    if (industry === "pharma") {
-      if (id === "copper") return "API Base (Phenol)";
-      if (id === "steel") return "Organic Solvents";
-      if (id === "aluminum") return "Aluminum Foil";
-      if (id === "nickel") return "Borosilicate Glass";
-    } else if (industry === "retail") {
-      if (id === "copper") return "Cotton No. 2 (ICE)";
-      if (id === "steel") return "Kraft Paper & Pulp";
-      if (id === "aluminum") return "PET Plastics";
-      if (id === "nickel") return "Agricultural Grains";
-    }
+    const found = commodities.find(c => c.id === id);
+    if (found) return found.name;
+    // fallback
     if (id === "copper") return "Copper (LME)";
     if (id === "steel") return "Steel HRC (NYMEX)";
     if (id === "aluminum") return "Aluminum (LME)";

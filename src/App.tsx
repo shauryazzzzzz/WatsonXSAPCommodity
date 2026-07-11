@@ -7,6 +7,7 @@ import GeopoliticalRisks from "./components/GeopoliticalRisks";
 import StrategyAdvisory from "./components/StrategyAdvisory";
 import BackendSheetsView from "./components/BackendSheetsView";
 import ExcelDatabaseView from "./components/ExcelDatabaseView";
+import DataFlowArchitecture from "./components/DataFlowArchitecture";
 import { 
   BarChart3, 
   Globe2, 
@@ -24,17 +25,82 @@ import {
   FileSpreadsheet,
   Car,
   Pill,
-  ShoppingBag
+  ShoppingBag,
+  PhoneCall,
+  DollarSign,
+  Landmark,
+  Droplets,
+  Factory,
+  Cpu,
+  Building
 } from "lucide-react";
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
 
+const INDUSTRIES = [
+  { id: "automobile", name: "Automobile" },
+  { id: "pharma", name: "Pharma" },
+  { id: "retail", name: "Retail" },
+  { id: "telecom", name: "Telecom" },
+  { id: "finance", name: "Finance" },
+  { id: "banks", name: "Banks" },
+  { id: "oil_gas", name: "Oil & Gas" },
+  { id: "manufacturing", name: "Manufacturing" },
+  { id: "software", name: "Software" }
+];
+
+const getIndustryIcon = (id: string) => {
+  switch (id) {
+    case "automobile": return <Car className="w-4 h-4" />;
+    case "pharma": return <Pill className="w-4 h-4" />;
+    case "retail": return <ShoppingBag className="w-4 h-4" />;
+    case "telecom": return <PhoneCall className="w-4 h-4" />;
+    case "finance": return <DollarSign className="w-4 h-4" />;
+    case "banks": return <Landmark className="w-4 h-4" />;
+    case "oil_gas": return <Droplets className="w-4 h-4" />;
+    case "manufacturing": return <Factory className="w-4 h-4" />;
+    case "software": return <Cpu className="w-4 h-4" />;
+    default: return <Building className="w-4 h-4" />;
+  }
+};
+
+const getClientName = (id: string) => {
+  const clients: Record<string, string> = {
+    automobile: "Maruti Suzuki",
+    pharma: "Sun Pharma",
+    retail: "Reliance Retail",
+    telecom: "Bharti Airtel",
+    finance: "State Bank of India",
+    banks: "HDFC Bank",
+    oil_gas: "Reliance Industries",
+    manufacturing: "Tata Motors",
+    software: "Tata Consultancy Services"
+  };
+  return clients[id] || (id.charAt(0).toUpperCase() + id.slice(1).replace("_", " ") + " Corp");
+};
+
+const getSectorName = (id: string) => {
+  const sectors: Record<string, string> = {
+    automobile: "Automotive Sector",
+    pharma: "LifeSciences & Pharma",
+    retail: "Consumer & Retail Sector",
+    telecom: "Telecom & Telecom Infrastructure",
+    finance: "Financial Services & Treasury",
+    banks: "Banking & Retail Wealth",
+    oil_gas: "Energy, Oil & Gas Sector",
+    manufacturing: "Heavy Industry & Manufacturing",
+    software: "Software & Cloud Services"
+  };
+  return sectors[id] || (id.charAt(0).toUpperCase() + id.slice(1).replace("_", " ") + " Sector");
+};
+
 export default function App() {
   // Active states
-  const [activeTab, setActiveTab] = useState<"materials" | "excel_db" | "commodities" | "risks" | "strategy" | "backend_sheet">("materials");
+  const [activeTab, setActiveTab] = useState<"materials" | "excel_db" | "commodities" | "risks" | "strategy" | "backend_sheet" | "architecture">("materials");
   const [materials, setMaterials] = useState<Material[]>([]);
   const [commodities, setCommodities] = useState<CommodityMarket[]>([]);
   const [riskCatalog, setRiskCatalog] = useState<GeopoliticalRisk[]>([]);
-  const [activeIndustry, setActiveIndustry] = useState<"automobile" | "pharma" | "retail">("automobile");
+  const [activeIndustry, setActiveIndustry] = useState<string>("automobile");
+  const [isPollingEnabled, setIsPollingEnabled] = useState(true);
   
   // Selection and simulation states
   const [selectedMaterialId, setSelectedMaterialId] = useState<string | null>(null);
@@ -46,6 +112,35 @@ export default function App() {
     nickel: 0
   });
 
+  // Poll materials and commodities dynamically every 15 seconds if enabled
+  useEffect(() => {
+    if (!isPollingEnabled) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const [materialsRes, commoditiesRes, risksRes] = await Promise.all([
+          fetch(`/api/materials?industry=${activeIndustry}`),
+          fetch(`/api/commodities?industry=${activeIndustry}`),
+          fetch(`/api/geopolitical-risks?industry=${activeIndustry}`)
+        ]);
+
+        if (materialsRes.ok && commoditiesRes.ok && risksRes.ok) {
+          const materialsData = await materialsRes.json();
+          const commoditiesData = await commoditiesRes.json();
+          const risksData = await risksRes.json();
+
+          setMaterials(materialsData);
+          setCommodities(commoditiesData);
+          setRiskCatalog(risksData);
+        }
+      } catch (err) {
+        console.error("Auto-polling dashboard data failed:", err);
+      }
+    }, 15000);
+
+    return () => clearInterval(interval);
+  }, [isPollingEnabled, activeIndustry]);
+
   // AI strategy text and loaders
   const [strategyMemo, setStrategyMemo] = useState<string>("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -54,17 +149,9 @@ export default function App() {
 
   // Dynamic names
   const getCommodityName = (id: string) => {
-    if (activeIndustry === "pharma") {
-      if (id === "copper") return "API Base (Phenol)";
-      if (id === "steel") return "Organic Solvents";
-      if (id === "aluminum") return "Aluminum Foil";
-      if (id === "nickel") return "Borosilicate Glass";
-    } else if (activeIndustry === "retail") {
-      if (id === "copper") return "Cotton No. 2 (ICE)";
-      if (id === "steel") return "Kraft Paper & Pulp";
-      if (id === "aluminum") return "PET Plastics";
-      if (id === "nickel") return "Agricultural Grains";
-    }
+    const found = commodities.find(c => c.id === id);
+    if (found) return found.name;
+    // fallback
     if (id === "copper") return "Copper (LME)";
     if (id === "steel") return "Steel HRC (NYMEX)";
     if (id === "aluminum") return "Aluminum (LME)";
@@ -108,7 +195,7 @@ export default function App() {
   const generateStrategyMemo = async (
     currentMaterials: Material[], 
     currentRates: typeof simulationRates,
-    industryToUse: "automobile" | "pharma" | "retail" = activeIndustry
+    industryToUse: string = activeIndustry
   ) => {
     try {
       setIsGenerating(true);
@@ -239,7 +326,7 @@ export default function App() {
                 </span>
               </div>
               <p className="text-xs text-slate-500 mt-0.5">
-                Principal SAP Material Master exchange rate correlation, forecasting, and hedge strategist for {activeIndustry === "pharma" ? "Sun Pharma" : activeIndustry === "retail" ? "Reliance Retail" : "Maruti Suzuki"}.
+                Principal SAP Material Master exchange rate correlation, forecasting, and hedge strategist for {getClientName(activeIndustry)}.
               </p>
             </div>
           </div>
@@ -253,7 +340,7 @@ export default function App() {
             <div className="flex items-center gap-3 hidden md:flex">
               <div className="text-right">
                 <p className="text-xs font-bold text-slate-800">SAP Global Consultant</p>
-                <p className="text-[10px] text-slate-500">{activeIndustry === "pharma" ? "LifeSciences & Pharma" : activeIndustry === "retail" ? "Consumer & Retail Sector" : "Automobile Sector"}</p>
+                <p className="text-[10px] text-slate-500">{getSectorName(activeIndustry)}</p>
               </div>
               <div className="w-10 h-10 rounded-full bg-slate-100 border-2 border-white shadow-sm flex items-center justify-center text-slate-700 italic font-serif font-bold">JD</div>
             </div>
@@ -283,42 +370,21 @@ export default function App() {
               </p>
             </div>
 
-            <div className="flex flex-wrap gap-2.5 w-full md:w-auto">
-              <button
-                onClick={() => setActiveIndustry("automobile")}
-                className={`flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer border ${
-                  activeIndustry === "automobile"
-                    ? "bg-indigo-600 text-white border-indigo-500 shadow-sm shadow-indigo-600/30"
-                    : "bg-slate-900/60 text-slate-400 border-slate-800 hover:text-white hover:bg-slate-800"
-                }`}
-              >
-                <Car className="w-4 h-4" />
-                Automobile (Maruti Suzuki)
-              </button>
-
-              <button
-                onClick={() => setActiveIndustry("pharma")}
-                className={`flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer border ${
-                  activeIndustry === "pharma"
-                    ? "bg-indigo-600 text-white border-indigo-500 shadow-sm shadow-indigo-600/30"
-                    : "bg-slate-900/60 text-slate-400 border-slate-800 hover:text-white hover:bg-slate-800"
-                }`}
-              >
-                <Pill className="w-4 h-4" />
-                Pharma (Sun Pharma)
-              </button>
-
-              <button
-                onClick={() => setActiveIndustry("retail")}
-                className={`flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer border ${
-                  activeIndustry === "retail"
-                    ? "bg-indigo-600 text-white border-indigo-500 shadow-sm shadow-indigo-600/30"
-                    : "bg-slate-900/60 text-slate-400 border-slate-800 hover:text-white hover:bg-slate-800"
-                }`}
-              >
-                <ShoppingBag className="w-4 h-4" />
-                Retail (Reliance Retail)
-              </button>
+            <div className="flex flex-wrap gap-2 w-full md:w-auto">
+              {INDUSTRIES.map((ind) => (
+                <button
+                  key={ind.id}
+                  onClick={() => setActiveIndustry(ind.id)}
+                  className={`flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer border ${
+                    activeIndustry === ind.id
+                      ? "bg-indigo-600 text-white border-indigo-500 shadow-sm shadow-indigo-600/30"
+                      : "bg-slate-900/60 text-slate-400 border-slate-800 hover:text-white hover:bg-slate-800"
+                  }`}
+                >
+                  {getIndustryIcon(ind.id)}
+                  {ind.name}
+                </button>
+              ))}
             </div>
           </div>
 
@@ -498,6 +564,19 @@ export default function App() {
                 <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
                 Unified ERP & Commodity Sheet
               </button>
+
+              <button
+                onClick={() => setActiveTab("architecture")}
+                className={`px-5 py-3.5 text-xs font-semibold border-b-2 transition-all flex items-center gap-2 whitespace-nowrap cursor-pointer ${
+                  activeTab === "architecture"
+                    ? "border-indigo-600 text-indigo-600 bg-indigo-50/40"
+                    : "border-transparent text-slate-500 hover:text-slate-800"
+                }`}
+                id="tab-btn-architecture"
+              >
+                <Cpu className="w-4 h-4 text-indigo-500" />
+                Data Flow & Architecture
+              </button>
             </div>
 
             {/* Tab Renderers */}
@@ -662,6 +741,15 @@ export default function App() {
                   commodities={commodities}
                   onUpdateMaterials={handleUpdateMaterialsList}
                   activeIndustry={activeIndustry}
+                />
+              )}
+
+              {activeTab === "architecture" && (
+                <DataFlowArchitecture
+                  activeIndustry={activeIndustry}
+                  onRefreshAllData={() => refreshAllDashboardData(false)}
+                  isPollingEnabled={isPollingEnabled}
+                  onTogglePolling={() => setIsPollingEnabled(!isPollingEnabled)}
                 />
               )}
             </div>

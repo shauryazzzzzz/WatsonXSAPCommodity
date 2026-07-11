@@ -4,9 +4,222 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import fs from "fs";
-import * as XLSX from "xlsx";
+import * as XLSX_MODULE from "xlsx";
+const XLSX: any = (XLSX_MODULE as any).default && typeof (XLSX_MODULE as any).default.readFile === "function" 
+  ? (XLSX_MODULE as any).default 
+  : XLSX_MODULE;
 
 dotenv.config();
+
+const DATA_DIR = path.join(process.cwd(), "data");
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+const CONFIG_FILE_PATH = path.join(DATA_DIR, "system_config.xlsx");
+
+const DEFAULT_VARIABLES = [
+  { Key: "USD_INR_DEFAULT", Value: "83.45", Type: "number", Description: "Initial or fallback USD to INR exchange rate" },
+  { Key: "USD_EUR_DEFAULT", Value: "0.9200", Type: "number", Description: "Initial or fallback USD to EUR exchange rate" },
+  { Key: "TICKER_INTERVAL_SEC", Value: "60", Type: "number", Description: "Frequency of background commodity market fluctuations in seconds" },
+  { Key: "MAX_FLUC_PCT", Value: "1.5", Type: "number", Description: "Maximum price movement up or down in percentage per interval" },
+  { Key: "MIN_COMMODITY_PRICE", Value: "10", Type: "number", Description: "Hard lower bound for fluctuated commodity prices" },
+  { Key: "MAX_COMMODITY_PRICE", Value: "100000", Type: "number", Description: "Hard upper bound for fluctuated commodity prices" },
+  { Key: "PRIMARY_GEMINI_MODEL", Value: "gemini-3.5-flash", Type: "string", Description: "Primary LLM model for strategic suggestions" },
+  { Key: "FALLBACK_GEMINI_MODEL", Value: "gemini-3.1-flash-lite", Type: "string", Description: "Fallback LLM model in case quota is exceeded" },
+  { Key: "FX_API_URL", Value: "https://open.er-api.com/v6/latest/USD", Type: "string", Description: "Public FX rate JSON API endpoint" },
+  { Key: "FX_REFRESH_INTERVAL_MIN", Value: "5", Type: "number", Description: "Interval in minutes to synchronize live foreign exchange rates" }
+];
+
+const DEFAULT_INDUSTRIES = [
+  { IndustryID: "automobile", DisplayName: "Automobile (Maruti Suzuki)", ClientName: "Maruti Suzuki India Ltd.", SectorName: "Automotive Manufacturing", Active: "TRUE" },
+  { IndustryID: "pharma", DisplayName: "Pharma (Sun Pharma)", ClientName: "Sun Pharmaceutical Industries", SectorName: "Pharmaceuticals", Active: "TRUE" },
+  { IndustryID: "retail", DisplayName: "Retail (Reliance Retail)", ClientName: "Reliance Retail Ventures", SectorName: "Consumer Retail", Active: "TRUE" },
+  { IndustryID: "telecom", DisplayName: "Telecom (Bharti Airtel)", ClientName: "Bharti Airtel Limited", SectorName: "Telecommunications", Active: "TRUE" },
+  { IndustryID: "finance", DisplayName: "Finance (SBI Treasury)", ClientName: "State Bank of India Treasury", SectorName: "Banking & Treasury", Active: "TRUE" },
+  { IndustryID: "banks", DisplayName: "Banks (HDFC Bank)", ClientName: "HDFC Bank Limited", SectorName: "Commercial Banking", Active: "TRUE" },
+  { IndustryID: "oil_gas", DisplayName: "Oil & Gas (Reliance Industries)", ClientName: "Reliance Industries Oil & Gas Division", SectorName: "Energy & Petrochemicals", Active: "TRUE" },
+  { IndustryID: "manufacturing", DisplayName: "Manufacturing (Tata Motors)", ClientName: "Tata Motors Commercial Vehicles", SectorName: "Heavy Manufacturing", Active: "TRUE" },
+  { IndustryID: "software", DisplayName: "Software (TCS Cloud Services)", ClientName: "Tata Consultancy Services Cloud Infra", SectorName: "Information Technology", Active: "TRUE" }
+];
+
+const DEFAULT_COMMODITY_REGISTRY = [
+  { ID: "copper", Name: "Electrolytic Copper Grade A", Symbol: "MCX-COP", Unit: "USD/MT", Volatility: "Medium", InitialPrice: "8500" },
+  { ID: "steel", Name: "Tensile Rack Steel Index", Symbol: "RAK-ST", Unit: "USD/MT", Volatility: "Low", InitialPrice: "710" },
+  { ID: "aluminum", Name: "Blade Server cooling Aluminum", Symbol: "BLD-AL", Unit: "USD/MT", Volatility: "Medium", InitialPrice: "2280" },
+  { ID: "nickel", Name: "UPS Battery Nickel Core Index", Symbol: "UPS-NIC", Unit: "USD/MT", Volatility: "High", InitialPrice: "15600" }
+];
+
+interface LoadedSystemConfig {
+  variables: Record<string, any>;
+  industries: Array<{ id: string; name: string; clientName: string; sectorName: string; excelFileName: string }>;
+  commodities: Array<{ id: string; name: string; symbol: string; unit: string; volatility: string; initialPrice: number }>;
+}
+
+// Read from system_config.xlsx with real-time on-the-fly execution
+export function loadSystemConfig(): LoadedSystemConfig {
+  const filePath = CONFIG_FILE_PATH;
+  
+  if (!fs.existsSync(filePath)) {
+    const wb = XLSX.utils.book_new();
+    
+    const wsVars = XLSX.utils.json_to_sheet(DEFAULT_VARIABLES);
+    XLSX.utils.book_append_sheet(wb, wsVars, "GlobalVariables");
+    
+    const wsInds = XLSX.utils.json_to_sheet(DEFAULT_INDUSTRIES);
+    XLSX.utils.book_append_sheet(wb, wsInds, "IndustryRegistry");
+    
+    const wsComms = XLSX.utils.json_to_sheet(DEFAULT_COMMODITY_REGISTRY);
+    XLSX.utils.book_append_sheet(wb, wsComms, "CommodityDefaults");
+    
+    XLSX.writeFile(wb, filePath);
+    console.log(`[SYSTEM_CONFIG] Initialized dynamic config at ${filePath}`);
+  }
+  
+  try {
+    const wb = XLSX.readFile(filePath);
+    
+    // Parse Global Variables
+    const wsVars = wb.Sheets["GlobalVariables"];
+    const rawVars = wsVars ? XLSX.utils.sheet_to_json(wsVars) : [];
+    const variables: Record<string, any> = {};
+    rawVars.forEach((v: any) => {
+      if (v.Key) {
+        if (v.Type === "number") {
+          variables[v.Key] = Number(v.Value);
+        } else if (v.Type === "boolean") {
+          variables[v.Key] = v.Value === "true" || v.Value === "TRUE" || v.Value === true;
+        } else {
+          variables[v.Key] = String(v.Value);
+        }
+      }
+    });
+    
+    // Parse Industry Registry
+    const wsInds = wb.Sheets["IndustryRegistry"];
+    const rawInds = wsInds ? XLSX.utils.sheet_to_json(wsInds) : [];
+    const industries = rawInds
+      .filter((i: any) => i.Active === "true" || i.Active === "TRUE" || i.Active === true || i.Active === "1" || i.Active === 1)
+      .map((i: any) => ({
+        id: String(i.IndustryID),
+        name: String(i.DisplayName),
+        clientName: String(i.ClientName),
+        sectorName: String(i.SectorName),
+        excelFileName: String(i.ExcelFileName || `sap_${i.IndustryID}.xlsx`)
+      }));
+      
+    // Parse Commodity Registry
+    const wsComms = wb.Sheets["CommodityDefaults"];
+    const rawComms = wsComms ? XLSX.utils.sheet_to_json(wsComms) : [];
+    const commodities = rawComms.map((c: any) => ({
+      id: String(c.ID),
+      name: String(c.Name),
+      symbol: String(c.Symbol),
+      unit: String(c.Unit),
+      volatility: String(c.Volatility),
+      initialPrice: Number(c.InitialPrice)
+    }));
+    
+    // Merge loaded config with static defaults to avoid missing keys
+    const mergedVars = {
+      ...DEFAULT_VARIABLES.reduce((acc, v) => ({ ...acc, [v.Key]: v.Type === "number" ? Number(v.Value) : v.Value }), {}),
+      ...variables
+    };
+    
+    return {
+      variables: mergedVars,
+      industries: industries.length > 0 ? industries : DEFAULT_INDUSTRIES.map(i => ({
+        id: i.IndustryID,
+        name: i.DisplayName,
+        clientName: i.ClientName,
+        sectorName: i.SectorName,
+        excelFileName: `sap_${i.IndustryID}.xlsx`
+      })),
+      commodities: commodities.length > 0 ? commodities : DEFAULT_COMMODITY_REGISTRY.map(c => ({
+        id: c.ID,
+        name: c.Name,
+        symbol: c.Symbol,
+        unit: c.Unit,
+        volatility: c.Volatility,
+        initialPrice: Number(c.InitialPrice)
+      }))
+    };
+  } catch (err) {
+    console.error("[SYSTEM_CONFIG] Error reading system_config.xlsx, using default templates", err);
+    return {
+      variables: DEFAULT_VARIABLES.reduce((acc, v) => ({ ...acc, [v.Key]: v.Type === "number" ? Number(v.Value) : v.Value }), {}),
+      industries: DEFAULT_INDUSTRIES.map(i => ({
+        id: i.IndustryID,
+        name: i.DisplayName,
+        clientName: i.ClientName,
+        sectorName: i.SectorName,
+        excelFileName: `sap_${i.IndustryID}.xlsx`
+      })),
+      commodities: DEFAULT_COMMODITY_REGISTRY.map(c => ({
+        id: c.ID,
+        name: c.Name,
+        symbol: c.Symbol,
+        unit: c.Unit,
+        volatility: c.Volatility,
+        initialPrice: Number(c.InitialPrice)
+      }))
+    };
+  }
+}
+
+// Write back updated global configuration values to excel file
+function saveSystemConfigVariables(updatedVars: Record<string, any>) {
+  const filePath = CONFIG_FILE_PATH;
+  try {
+    const currentConfig = loadSystemConfig();
+    const wb = XLSX.utils.book_new();
+    
+    // Map current variables list with newly updated values
+    const sheetData = DEFAULT_VARIABLES.map(v => {
+      const userValue = updatedVars[v.Key] !== undefined ? String(updatedVars[v.Key]) : v.Value;
+      return {
+        Key: v.Key,
+        Value: userValue,
+        Type: v.Type,
+        Description: v.Description
+      };
+    });
+    
+    const wsVars = XLSX.utils.json_to_sheet(sheetData);
+    XLSX.utils.book_append_sheet(wb, wsVars, "GlobalVariables");
+    
+    // Preserve existing sheets
+    const wsInds = XLSX.utils.json_to_sheet(
+      currentConfig.industries.map(i => ({
+        IndustryID: i.id,
+        DisplayName: i.name,
+        ClientName: i.clientName,
+        SectorName: i.sectorName,
+        Active: "TRUE"
+      }))
+    );
+    XLSX.utils.book_append_sheet(wb, wsInds, "IndustryRegistry");
+    
+    const wsComms = XLSX.utils.json_to_sheet(
+      currentConfig.commodities.map(c => ({
+        ID: c.id,
+        Name: c.name,
+        Symbol: c.symbol,
+        Unit: c.unit,
+        Volatility: c.volatility,
+        InitialPrice: String(c.initialPrice)
+      }))
+    );
+    XLSX.utils.book_append_sheet(wb, wsComms, "CommodityDefaults");
+    
+    XLSX.writeFile(wb, filePath);
+    console.log(`[SYSTEM_CONFIG] Successfully wrote system variables into Excel at ${filePath}`);
+    return true;
+  } catch (err) {
+    console.error("[SYSTEM_CONFIG] Failed to save updated variables to system_config.xlsx", err);
+    throw err;
+  }
+}
 
 const app = express();
 const PORT = 3000;
@@ -337,26 +550,30 @@ const getGeminiClient = () => {
   });
 };
 
-// Helper to generate content with fallback models if the primary model is busy or fails
+// Helper to generate content with fallback models if the primary model is busy or has quota limits
 const generateContentWithModelFallback = async (ai: any, params: {
   contents: any;
   config?: any;
 }) => {
+  const sysConfig = loadSystemConfig();
+  const primaryModel = sysConfig.variables.PRIMARY_GEMINI_MODEL || "gemini-3.5-flash";
+  const fallbackModel = sysConfig.variables.FALLBACK_GEMINI_MODEL || "gemini-3.1-flash-lite";
+
   try {
-    console.log("Trying Gemini generation with primary model: gemini-3.5-flash");
+    console.log(`[Gemini] Trying generation with primary: ${primaryModel} (loaded from system_config.xlsx)`);
     return await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: primaryModel,
       ...params
     });
   } catch (error: any) {
-    console.warn(`Primary model gemini-3.5-flash failed (Code/Message: ${error.message || error}). Trying fallback model: gemini-3.1-flash-lite`);
+    console.log(`[Gemini] Primary model ${primaryModel} not available (Status: ${error.status || error.code || "unknown"}). Trying alternate: ${fallbackModel}`);
     try {
       return await ai.models.generateContent({
-        model: "gemini-3.1-flash-lite",
+        model: fallbackModel,
         ...params
       });
     } catch (fallbackError: any) {
-      console.error(`Fallback model gemini-3.1-flash-lite also failed:`, fallbackError.message || fallbackError);
+      console.log(`[Gemini] Alternate model ${fallbackModel} not available. Proceeding to offline fallback.`);
       throw error; // throw original error so the route's offline fallback can kick in
     }
   }
@@ -847,20 +1064,1240 @@ const RETAIL_RISKS = [
   { country: "China", riskScore: 3.9, status: "Caution", description: "PET polymer resins supplier subject to generic bilateral trade tariffs.", vendorCount: 1, materialShare: 6 }
 ];
 
-// Excel File Management and Persistence Setup
-const DATA_DIR = path.join(process.cwd(), "data");
+// Excel File Management and Persistence Setup (DATA_DIR is already initialized globally at top of file)
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const AUTOMOBILE_EXCEL_PATH = path.join(DATA_DIR, "sap_automobile.xlsx");
-const PHARMA_EXCEL_PATH = path.join(DATA_DIR, "sap_pharma.xlsx");
-const RETAIL_EXCEL_PATH = path.join(DATA_DIR, "sap_retail.xlsx");
+// -------------------------------------------------------------
+// NEW INDUSTRY DATASETS: TELECOM, FINANCE, BANKS, OIL & GAS, MANUFACTURING, SOFTWARE
+// -------------------------------------------------------------
+
+// 1. TELECOM (Bharti Airtel / Telecom Infrastructure)
+const TELECOM_MATERIALS = [
+  {
+    id: "MAT-TEL01",
+    name: "Optical Fiber Cable Double-Armored (Heavy Core)",
+    category: "Cabling Networks",
+    unitPrice: 12.5,
+    currency: "USD",
+    volume: 300000,
+    totalValue: 3750000,
+    vendorName: "Sterlite Technologies Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 5, steel: 35, aluminum: 5, nickel: 5, other: 50 },
+    isAiMapped: false,
+    inventoryUsed: 220000,
+    inventoryOrdered: 90000,
+    inventoryBufferStock: 30000
+  },
+  {
+    id: "MAT-TEL02",
+    name: "5G Heavy-Duty Galvanized Steel Tower Mast",
+    category: "Telecom Infrastructure",
+    unitPrice: 8500,
+    currency: "USD",
+    volume: 250,
+    totalValue: 2125000,
+    vendorName: "KEC International Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 2, steel: 85, aluminum: 5, nickel: 0, other: 8 },
+    isAiMapped: false,
+    inventoryUsed: 180,
+    inventoryOrdered: 80,
+    inventoryBufferStock: 25
+  },
+  {
+    id: "MAT-TEL03",
+    name: "Outdoor 5G Transceiver Unit (Massive MIMO Hub)",
+    category: "Active Radio Devices",
+    unitPrice: 4200,
+    currency: "USD",
+    volume: 600,
+    totalValue: 2520000,
+    vendorName: "Samsung Networks",
+    vendorCountry: "South Korea",
+    commodityWeights: { copper: 25, steel: 10, aluminum: 45, nickel: 10, other: 10 },
+    isAiMapped: false,
+    inventoryUsed: 450,
+    inventoryOrdered: 200,
+    inventoryBufferStock: 60
+  },
+  {
+    id: "MAT-TEL04",
+    name: "Telecom Lead-Acid Battery Storage Cabinet",
+    category: "Power Backup",
+    unitPrice: 350,
+    currency: "USD",
+    volume: 4000,
+    totalValue: 1400000,
+    vendorName: "Exide Industries Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 15, steel: 15, aluminum: 10, nickel: 55, other: 5 },
+    isAiMapped: false,
+    inventoryUsed: 2900,
+    inventoryOrdered: 1200,
+    inventoryBufferStock: 400
+  }
+];
+
+const TELECOM_COMMODITIES = [
+  {
+    id: "copper",
+    name: "Optical Fiber & Core copper Index",
+    symbol: "OFC-C",
+    currentPrice: 8400,
+    unit: "USD/MT",
+    change24h: 1.85,
+    volatility: "High",
+    history: [
+      { date: "Jul 25", price: 7900 },
+      { date: "Aug 25", price: 8100 },
+      { date: "Sep 25", price: 8050 },
+      { date: "Oct 25", price: 8120 },
+      { date: "Nov 25", price: 8200 },
+      { date: "Dec 25", price: 8150 },
+      { date: "Jan 26", price: 8300 },
+      { date: "Feb 26", price: 8280 },
+      { date: "Mar 26", price: 8350 },
+      { date: "Apr 26", price: 8420 },
+      { date: "May 26", price: 8380 },
+      { date: "Jun 26", price: 8400 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 8650, change: 3.0, signal: "up" },
+      { period: "Q4 2026", price: 8890, change: 5.8, signal: "up" },
+      { period: "Q1 2027", price: 8720, change: 3.8, signal: "down" },
+      { period: "Q2 2027", price: 8600, change: 2.4, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "OFCU26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 8420, expiryDate: "2026-09-16", lotSize: "25 Metric Tons", openInterest: 24000, volume: 3200 }
+    ]
+  },
+  {
+    id: "steel",
+    name: "Galvanized Steel Mast Index",
+    symbol: "MAST-S",
+    currentPrice: 780,
+    unit: "USD/MT",
+    change24h: -0.95,
+    volatility: "Low",
+    history: [
+      { date: "Jul 25", price: 840 },
+      { date: "Aug 25", price: 830 },
+      { date: "Sep 25", price: 815 },
+      { date: "Oct 25", price: 805 },
+      { date: "Nov 25", price: 795 },
+      { date: "Dec 25", price: 790 },
+      { date: "Jan 26", price: 785 },
+      { date: "Feb 26", price: 780 },
+      { date: "Mar 26", price: 795 },
+      { date: "Apr 26", price: 790 },
+      { date: "May 26", price: 782 },
+      { date: "Jun 26", price: 780 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 765, change: -1.9, signal: "down" },
+      { period: "Q4 2026", price: 745, change: -4.5, signal: "down" },
+      { period: "Q1 2027", price: 760, change: -2.6, signal: "up" },
+      { period: "Q2 2027", price: 775, change: -0.6, signal: "up" }
+    ],
+    foContracts: [
+      { symbol: "MSTS26 (Futures)", exchange: "SGE (Shanghai)", contractType: "Futures", currentPrice: 778, expiryDate: "2026-09-18", lotSize: "100 Metric Tons", openInterest: 14500, volume: 1800 }
+    ]
+  },
+  {
+    id: "aluminum",
+    name: "Transceiver Alloy Enclosure Index",
+    symbol: "TRAN-A",
+    currentPrice: 2480,
+    unit: "USD/MT",
+    change24h: 1.15,
+    volatility: "Medium",
+    history: [
+      { date: "Jul 25", price: 2320 },
+      { date: "Aug 25", price: 2350 },
+      { date: "Sep 25", price: 2390 },
+      { date: "Oct 25", price: 2370 },
+      { date: "Nov 25", price: 2420 },
+      { date: "Dec 25", price: 2440 },
+      { date: "Jan 26", price: 2450 },
+      { date: "Feb 26", price: 2470 },
+      { date: "Mar 26", price: 2510 },
+      { date: "Apr 26", price: 2490 },
+      { date: "May 26", price: 2460 },
+      { date: "Jun 26", price: 2480 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 2560, change: 3.2, signal: "up" },
+      { period: "Q4 2026", price: 2630, change: 6.0, signal: "up" },
+      { period: "Q1 2027", price: 2590, change: 4.4, signal: "down" },
+      { period: "Q2 2027", price: 2540, change: 2.4, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "TRNA26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 2495, expiryDate: "2026-09-16", lotSize: "25 Metric Tons", openInterest: 31000, volume: 4400 }
+    ]
+  },
+  {
+    id: "nickel",
+    name: "Battery Lead-Nickel Core Index",
+    symbol: "BATT-N",
+    currentPrice: 16800,
+    unit: "USD/MT",
+    change24h: 0.85,
+    volatility: "High",
+    history: [
+      { date: "Jul 25", price: 15500 },
+      { date: "Aug 25", price: 15750 },
+      { date: "Sep 25", price: 16100 },
+      { date: "Oct 25", price: 15950 },
+      { date: "Nov 25", price: 16300 },
+      { date: "Dec 25", price: 16420 },
+      { date: "Jan 26", price: 16500 },
+      { date: "Feb 26", price: 16650 },
+      { date: "Mar 26", price: 16900 },
+      { date: "Apr 26", price: 16750 },
+      { date: "May 26", price: 16620 },
+      { date: "Jun 26", price: 16800 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 17400, change: 3.5, signal: "up" },
+      { period: "Q4 2026", price: 18100, change: 7.7, signal: "up" },
+      { period: "Q1 2027", price: 17700, change: 5.3, signal: "down" },
+      { period: "Q2 2027", price: 17200, change: 2.3, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "BATN26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 16920, expiryDate: "2026-09-16", lotSize: "6 Metric Tons", openInterest: 42000, volume: 5600 }
+    ]
+  }
+];
+
+const TELECOM_RISKS = [
+  { country: "India", riskScore: 1.5, status: "Stable", description: "Vast local passive fabrication plants for fiber & masts.", vendorCount: 3, materialShare: 77 },
+  { country: "South Korea", riskScore: 2.0, status: "Stable", description: "Advanced high-volume active radio components corridors.", vendorCount: 1, materialShare: 23 }
+];
+
+// 2. FINANCE (State Bank of India / Treasury & Infrastructure)
+const FINANCE_MATERIALS = [
+  {
+    id: "MAT-FIN01",
+    name: "UTP Category 6A Shielded Lan Cables (Copper Core)",
+    category: "Cabling Networks",
+    unitPrice: 1.2,
+    currency: "USD",
+    volume: 1000000,
+    totalValue: 1200000,
+    vendorName: "Finolex Cables Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 85, steel: 0, aluminum: 5, nickel: 0, other: 10 },
+    isAiMapped: false,
+    inventoryUsed: 750000,
+    inventoryOrdered: 250000,
+    inventoryBufferStock: 80000
+  },
+  {
+    id: "MAT-FIN02",
+    name: "Enterprise Server Rack Chassis Unit (Heavy Framing)",
+    category: "Datacenter Hardware",
+    unitPrice: 1100,
+    currency: "USD",
+    volume: 1500,
+    totalValue: 1650000,
+    vendorName: "Rittal India Pvt Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 5, steel: 80, aluminum: 5, nickel: 5, other: 5 },
+    isAiMapped: false,
+    inventoryUsed: 1100,
+    inventoryOrdered: 400,
+    inventoryBufferStock: 150
+  },
+  {
+    id: "MAT-FIN03",
+    name: "Datacenter Liquid Cooling Radiator System",
+    category: "Thermal Management",
+    unitPrice: 15000,
+    currency: "USD",
+    volume: 120,
+    totalValue: 1800000,
+    vendorName: "Trane Sourcing Corp",
+    vendorCountry: "USA",
+    commodityWeights: { copper: 15, steel: 15, aluminum: 65, nickel: 5, other: 0 },
+    isAiMapped: false,
+    inventoryUsed: 80,
+    inventoryOrdered: 40,
+    inventoryBufferStock: 15
+  },
+  {
+    id: "MAT-FIN04",
+    name: "Hardware Security Module (HSM) Cryptographic Core",
+    category: "Secured Active Tech",
+    unitPrice: 25000,
+    currency: "USD",
+    volume: 80,
+    totalValue: 2000000,
+    vendorName: "Thales eSecurity",
+    vendorCountry: "France",
+    commodityWeights: { copper: 20, steel: 10, aluminum: 10, nickel: 50, other: 10 },
+    isAiMapped: false,
+    inventoryUsed: 60,
+    inventoryOrdered: 20,
+    inventoryBufferStock: 8
+  }
+];
+
+const FINANCE_COMMODITIES = [
+  {
+    id: "copper",
+    name: "Fintech Lan Infrastructure copper",
+    symbol: "FIN-C",
+    currentPrice: 8550,
+    unit: "USD/MT",
+    change24h: 1.45,
+    volatility: "High",
+    history: [
+      { date: "Jul 25", price: 8100 },
+      { date: "Aug 25", price: 8250 },
+      { date: "Sep 25", price: 8300 },
+      { date: "Oct 25", price: 8200 },
+      { date: "Nov 25", price: 8390 },
+      { date: "Dec 25", price: 8410 },
+      { date: "Jan 26", price: 8450 },
+      { date: "Feb 26", price: 8480 },
+      { date: "Mar 26", price: 8580 },
+      { date: "Apr 26", price: 8610 },
+      { date: "May 26", price: 8500 },
+      { date: "Jun 26", price: 8550 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 8780, change: 2.7, signal: "up" },
+      { period: "Q4 2026", price: 8990, change: 5.1, signal: "up" },
+      { period: "Q1 2027", price: 8850, change: 3.5, signal: "down" },
+      { period: "Q2 2027", price: 8700, change: 1.7, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "FINC26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 8570, expiryDate: "2026-09-16", lotSize: "25 Metric Tons", openInterest: 18000, volume: 2200 }
+    ]
+  },
+  {
+    id: "steel",
+    name: "Mainframe Steel Framing Index",
+    symbol: "MF-ST",
+    currentPrice: 650,
+    unit: "USD/MT",
+    change24h: -1.25,
+    volatility: "Low",
+    history: [
+      { date: "Jul 25", price: 710 },
+      { date: "Aug 25", price: 695 },
+      { date: "Sep 25", price: 680 },
+      { date: "Oct 25", price: 675 },
+      { date: "Nov 25", price: 660 },
+      { date: "Dec 25", price: 655 },
+      { date: "Jan 26", price: 650 },
+      { date: "Feb 26", price: 645 },
+      { date: "Mar 26", price: 655 },
+      { date: "Apr 26", price: 648 },
+      { date: "May 26", price: 642 },
+      { date: "Jun 26", price: 650 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 630, change: -3.0, signal: "down" },
+      { period: "Q4 2026", price: 615, change: -5.3, signal: "down" },
+      { period: "Q1 2027", price: 632, change: -2.7, signal: "up" },
+      { period: "Q2 2027", price: 645, change: -0.7, signal: "up" }
+    ],
+    foContracts: [
+      { symbol: "MFRK26 (Futures)", exchange: "SGE (Shanghai)", contractType: "Futures", currentPrice: 648, expiryDate: "2026-09-15", lotSize: "100 Metric Tons", openInterest: 8200, volume: 1100 }
+    ]
+  },
+  {
+    id: "aluminum",
+    name: "Cooling Radiator Alloy Index",
+    symbol: "COOL-A",
+    currentPrice: 2240,
+    unit: "USD/MT",
+    change24h: 0.85,
+    volatility: "Medium",
+    history: [
+      { date: "Jul 25", price: 2110 },
+      { date: "Aug 25", price: 2130 },
+      { date: "Sep 25", price: 2160 },
+      { date: "Oct 25", price: 2145 },
+      { date: "Nov 25", price: 2180 },
+      { date: "Dec 25", price: 2195 },
+      { date: "Jan 26", price: 2210 },
+      { date: "Feb 26", price: 2230 },
+      { date: "Mar 26", price: 2260 },
+      { date: "Apr 26", price: 2245 },
+      { date: "May 26", price: 2225 },
+      { date: "Jun 26", price: 2240 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 2310, change: 3.1, signal: "up" },
+      { period: "Q4 2026", price: 2380, change: 6.2, signal: "up" },
+      { period: "Q1 2027", price: 2340, change: 4.4, signal: "down" },
+      { period: "Q2 2027", price: 2290, change: 2.2, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "COLA26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 2250, expiryDate: "2026-09-16", lotSize: "25 Metric Tons", openInterest: 14500, volume: 2200 }
+    ]
+  },
+  {
+    id: "nickel",
+    name: "Crypto Processor Core Alloy",
+    symbol: "CRPT-N",
+    currentPrice: 15400,
+    unit: "USD/MT",
+    change24h: 1.15,
+    volatility: "High",
+    history: [
+      { date: "Jul 25", price: 14200 },
+      { date: "Aug 25", price: 14450 },
+      { date: "Sep 25", price: 14800 },
+      { date: "Oct 25", price: 14650 },
+      { date: "Nov 25", price: 14950 },
+      { date: "Dec 25", price: 15100 },
+      { date: "Jan 26", price: 15180 },
+      { date: "Feb 26", price: 15250 },
+      { date: "Mar 26", price: 15500 },
+      { date: "Apr 26", price: 15350 },
+      { date: "May 26", price: 15200 },
+      { date: "Jun 26", price: 15400 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 15950, change: 3.5, signal: "up" },
+      { period: "Q4 2026", price: 16600, change: 7.7, signal: "up" },
+      { period: "Q1 2027", price: 16250, change: 5.5, signal: "down" },
+      { period: "Q2 2027", price: 15800, change: 2.5, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "CRPN26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 15520, expiryDate: "2026-09-16", lotSize: "6 Metric Tons", openInterest: 26000, volume: 3400 }
+    ]
+  }
+];
+
+const FINANCE_RISKS = [
+  { country: "India", riskScore: 1.5, status: "Stable", description: "Vast engineering support base & stable connectivity lanes.", vendorCount: 2, materialShare: 43 },
+  { country: "USA", riskScore: 1.8, status: "Stable", description: "High-tier server thermal systems manufactured in strict environmental lanes.", vendorCount: 1, materialShare: 27 },
+  { country: "France", riskScore: 2.0, status: "Stable", description: "Advanced defense-grade cryptographic cores fabricators.", vendorCount: 1, materialShare: 30 }
+];
+
+// 3. BANKS (HDFC Bank / Retail Banking Networks)
+const BANKS_MATERIALS = [
+  {
+    id: "MAT-BNK01",
+    name: "Secure ATM Vault Heavy Welded Steel Chest",
+    category: "Cash Storage",
+    unitPrice: 4800,
+    currency: "USD",
+    volume: 1200,
+    totalValue: 5760000,
+    vendorName: "Godrej & Boyce Mfg Co Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 0, steel: 90, aluminum: 0, nickel: 8, other: 2 },
+    isAiMapped: false,
+    inventoryUsed: 850,
+    inventoryOrdered: 350,
+    inventoryBufferStock: 100
+  },
+  {
+    id: "MAT-BNK02",
+    name: "Multi-Core Smart Card EMV Microchips",
+    category: "Customer Issuance",
+    unitPrice: 0.85,
+    currency: "USD",
+    volume: 4000000,
+    totalValue: 3400000,
+    vendorName: "Infineon Technologies AG",
+    vendorCountry: "Germany",
+    commodityWeights: { copper: 15, steel: 5, aluminum: 5, nickel: 70, other: 5 },
+    isAiMapped: false,
+    inventoryUsed: 2900000,
+    inventoryOrdered: 1100000,
+    inventoryBufferStock: 300000
+  },
+  {
+    id: "MAT-BNK03",
+    name: "Branch Biometric USB Fingerprint Scanner",
+    category: "Branch Hardware",
+    unitPrice: 120,
+    currency: "USD",
+    volume: 15000,
+    totalValue: 1800000,
+    vendorName: "SecuGen India Sourcing",
+    vendorCountry: "India",
+    commodityWeights: { copper: 35, steel: 10, aluminum: 45, nickel: 5, other: 5 },
+    isAiMapped: false,
+    inventoryUsed: 11000,
+    inventoryOrdered: 4000,
+    inventoryBufferStock: 1200
+  },
+  {
+    id: "MAT-BNK04",
+    name: "HDSL branch High-Speed Ethernet patch Cable",
+    category: "Branch LAN",
+    unitPrice: 5.5,
+    currency: "USD",
+    volume: 150000,
+    totalValue: 825000,
+    vendorName: "D-Link India Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 92, steel: 0, aluminum: 3, nickel: 0, other: 5 },
+    isAiMapped: false,
+    inventoryUsed: 120000,
+    inventoryOrdered: 30000,
+    inventoryBufferStock: 8000
+  }
+];
+
+const BANKS_COMMODITIES = [
+  {
+    id: "copper",
+    name: "Branch LAN Cabling copper Index",
+    symbol: "CABL-C",
+    currentPrice: 8480,
+    unit: "USD/MT",
+    change24h: 1.15,
+    volatility: "High",
+    history: [
+      { date: "Jul 25", price: 8000 },
+      { date: "Aug 25", price: 8120 },
+      { date: "Sep 25", price: 8180 },
+      { date: "Oct 25", price: 8080 },
+      { date: "Nov 25", price: 8250 },
+      { date: "Dec 25", price: 8310 },
+      { date: "Jan 26", price: 8350 },
+      { date: "Feb 26", price: 8380 },
+      { date: "Mar 26", price: 8460 },
+      { date: "Apr 26", price: 8490 },
+      { date: "May 26", price: 8410 },
+      { date: "Jun 26", price: 8480 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 8690, change: 2.4, signal: "up" },
+      { period: "Q4 2026", price: 8910, change: 5.0, signal: "up" },
+      { period: "Q1 2027", price: 8750, change: 3.1, signal: "down" },
+      { period: "Q2 2027", price: 8620, change: 1.6, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "CBLC26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 8495, expiryDate: "2026-09-16", lotSize: "25 Metric Tons", openInterest: 14800, volume: 1950 }
+    ]
+  },
+  {
+    id: "steel",
+    name: "Heavy Vault Structural Steel",
+    symbol: "VLT-ST",
+    currentPrice: 720,
+    unit: "USD/MT",
+    change24h: -1.05,
+    volatility: "Low",
+    history: [
+      { date: "Jul 25", price: 780 },
+      { date: "Aug 25", price: 765 },
+      { date: "Sep 25", price: 750 },
+      { date: "Oct 25", price: 742 },
+      { date: "Nov 25", price: 730 },
+      { date: "Dec 25", price: 725 },
+      { date: "Jan 26", price: 720 },
+      { date: "Feb 26", price: 715 },
+      { date: "Mar 26", price: 725 },
+      { date: "Apr 26", price: 718 },
+      { date: "May 26", price: 712 },
+      { date: "Jun 26", price: 720 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 700, change: -2.7, signal: "down" },
+      { period: "Q4 2026", price: 685, change: -4.8, signal: "down" },
+      { period: "Q1 2027", price: 702, change: -2.5, signal: "up" },
+      { period: "Q2 2027", price: 715, change: -0.6, signal: "up" }
+    ],
+    foContracts: [
+      { symbol: "VLTS26 (Futures)", exchange: "SGE (Shanghai)", contractType: "Futures", currentPrice: 718, expiryDate: "2026-09-15", lotSize: "100 Metric Tons", openInterest: 9200, volume: 1300 }
+    ]
+  },
+  {
+    id: "aluminum",
+    name: "Scanner Enclosure Aluminum",
+    symbol: "SCAN-AL",
+    currentPrice: 2310,
+    unit: "USD/MT",
+    change24h: 0.95,
+    volatility: "Medium",
+    history: [
+      { date: "Jul 25", price: 2180 },
+      { date: "Aug 25", price: 2200 },
+      { date: "Sep 25", price: 2230 },
+      { date: "Oct 25", price: 2210 },
+      { date: "Nov 25", price: 2250 },
+      { date: "Dec 25", price: 2265 },
+      { date: "Jan 26", price: 2280 },
+      { date: "Feb 26", price: 2300 },
+      { date: "Mar 26", price: 2330 },
+      { date: "Apr 26", price: 2315 },
+      { date: "May 26", price: 2295 },
+      { date: "Jun 26", price: 2310 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 2380, change: 3.0, signal: "up" },
+      { period: "Q4 2026", price: 2450, change: 6.0, signal: "up" },
+      { period: "Q1 2027", price: 2410, change: 4.3, signal: "down" },
+      { period: "Q2 2027", price: 2360, change: 2.1, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "SCNAL26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 2320, expiryDate: "2026-09-16", lotSize: "25 Metric Tons", openInterest: 12400, volume: 1800 }
+    ]
+  },
+  {
+    id: "nickel",
+    name: "EMV Chip Silicon-Nickel Substrate",
+    symbol: "CHIP-N",
+    currentPrice: 16100,
+    unit: "USD/MT",
+    change24h: 1.25,
+    volatility: "High",
+    history: [
+      { date: "Jul 25", price: 14800 },
+      { date: "Aug 25", price: 15100 },
+      { date: "Sep 25", price: 15450 },
+      { date: "Oct 25", price: 15300 },
+      { date: "Nov 25", price: 15650 },
+      { date: "Dec 25", price: 15800 },
+      { date: "Jan 26", price: 15880 },
+      { date: "Feb 26", price: 15950 },
+      { date: "Mar 26", price: 16200 },
+      { date: "Apr 26", price: 16050 },
+      { date: "May 26", price: 15900 },
+      { date: "Jun 26", price: 16100 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 16680, change: 3.6, signal: "up" },
+      { period: "Q4 2026", price: 17350, change: 7.7, signal: "up" },
+      { period: "Q1 2027", price: 16980, change: 5.4, signal: "down" },
+      { period: "Q2 2027", price: 16500, change: 2.4, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "CHPN26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 16220, expiryDate: "2026-09-16", lotSize: "6 Metric Tons", openInterest: 21500, volume: 2800 }
+    ]
+  }
+];
+
+const BANKS_RISKS = [
+  { country: "India", riskScore: 1.5, status: "Stable", description: "Vast manufacturing and secure safe physical fabrication base.", vendorCount: 3, materialShare: 71 },
+  { country: "Germany", riskScore: 1.8, status: "Stable", description: "Precision microchip fabrication corridors under high ESG conformance.", vendorCount: 1, materialShare: 29 }
+];
+
+// 4. OIL & GAS (Reliance Industries / Exploration & Refining)
+const OIL_GAS_MATERIALS = [
+  {
+    id: "MAT-ONG01",
+    name: "Carbon Steel Seamless Drilling & Well Pipe",
+    category: "Drilling Assemblies",
+    unitPrice: 320,
+    currency: "USD",
+    volume: 20000,
+    totalValue: 6400000,
+    vendorName: "Maharashtra Seamless Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 0, steel: 95, aluminum: 0, nickel: 4, other: 1 },
+    isAiMapped: false,
+    inventoryUsed: 14500,
+    inventoryOrdered: 5500,
+    inventoryBufferStock: 1800
+  },
+  {
+    id: "MAT-ONG02",
+    name: "Corrosion-Resistant Nickel Alloy Flow Control Valve",
+    category: "Flow Control",
+    unitPrice: 4500,
+    currency: "USD",
+    volume: 1500,
+    totalValue: 6750000,
+    vendorName: "L&T Valves Sourcing Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 10, steel: 30, aluminum: 0, nickel: 58, other: 2 },
+    isAiMapped: false,
+    inventoryUsed: 1100,
+    inventoryOrdered: 400,
+    inventoryBufferStock: 120
+  },
+  {
+    id: "MAT-ONG03",
+    name: "Offshore Rig Heavy Structural Aluminum Decking",
+    category: "Rig Construction",
+    unitPrice: 15000,
+    currency: "USD",
+    volume: 250,
+    totalValue: 3750000,
+    vendorName: "Hindalco Structural Solutions",
+    vendorCountry: "India",
+    commodityWeights: { copper: 0, steel: 10, aluminum: 85, nickel: 0, other: 5 },
+    isAiMapped: false,
+    inventoryUsed: 190,
+    inventoryOrdered: 60,
+    inventoryBufferStock: 20
+  },
+  {
+    id: "MAT-ONG04",
+    name: "Rig Power System Heavy Subsea Cable",
+    category: "Rig Power Systems",
+    unitPrice: 120,
+    currency: "USD",
+    volume: 30000,
+    totalValue: 3600000,
+    vendorName: "Polycab India Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 85, steel: 10, aluminum: 2, nickel: 0, other: 3 },
+    isAiMapped: false,
+    inventoryUsed: 22000,
+    inventoryOrdered: 8000,
+    inventoryBufferStock: 2500
+  }
+];
+
+const OIL_GAS_COMMODITIES = [
+  {
+    id: "copper",
+    name: "Heavy Subsea Cable copper Index",
+    symbol: "CABL-ONG",
+    currentPrice: 8650,
+    unit: "USD/MT",
+    change24h: 1.65,
+    volatility: "High",
+    history: [
+      { date: "Jul 25", price: 8150 },
+      { date: "Aug 25", price: 8300 },
+      { date: "Sep 25", price: 8350 },
+      { date: "Oct 25", price: 8250 },
+      { date: "Nov 25", price: 8420 },
+      { date: "Dec 25", price: 8480 },
+      { date: "Jan 26", price: 8520 },
+      { date: "Feb 26", price: 8560 },
+      { date: "Mar 26", price: 8650 },
+      { date: "Apr 26", price: 8680 },
+      { date: "May 26", price: 8580 },
+      { date: "Jun 26", price: 8650 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 8880, change: 2.6, signal: "up" },
+      { period: "Q4 2026", price: 9150, change: 5.7, signal: "up" },
+      { period: "Q1 2027", price: 8980, change: 3.8, signal: "down" },
+      { period: "Q2 2027", price: 8820, change: 1.9, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "ONGC26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 8670, expiryDate: "2026-09-16", lotSize: "25 Metric Tons", openInterest: 16500, volume: 2100 }
+    ]
+  },
+  {
+    id: "steel",
+    name: "Carbon Steel Drilling Tube Index",
+    symbol: "TUBE-ST",
+    currentPrice: 810,
+    unit: "USD/MT",
+    change24h: -1.15,
+    volatility: "Low",
+    history: [
+      { date: "Jul 25", price: 870 },
+      { date: "Aug 25", price: 855 },
+      { date: "Sep 25", price: 840 },
+      { date: "Oct 25", price: 832 },
+      { date: "Nov 25", price: 820 },
+      { date: "Dec 25", price: 815 },
+      { date: "Jan 26", price: 810 },
+      { date: "Feb 26", price: 805 },
+      { date: "Mar 26", price: 815 },
+      { date: "Apr 26", price: 808 },
+      { date: "May 26", price: 802 },
+      { date: "Jun 26", price: 810 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 790, change: -2.4, signal: "down" },
+      { period: "Q4 2026", price: 770, change: -4.9, signal: "down" },
+      { period: "Q1 2027", price: 788, change: -2.7, signal: "up" },
+      { period: "Q2 2027", price: 805, change: -0.6, signal: "up" }
+    ],
+    foContracts: [
+      { symbol: "ONGS26 (Futures)", exchange: "SGE (Shanghai)", contractType: "Futures", currentPrice: 808, expiryDate: "2026-09-15", lotSize: "100 Metric Tons", openInterest: 11200, volume: 1500 }
+    ]
+  },
+  {
+    id: "aluminum",
+    name: "Offshore Structural Aluminum",
+    symbol: "AL-DECK",
+    currentPrice: 2540,
+    unit: "USD/MT",
+    change24h: 1.05,
+    volatility: "Medium",
+    history: [
+      { date: "Jul 25", price: 2380 },
+      { date: "Aug 25", price: 2410 },
+      { date: "Sep 25", price: 2450 },
+      { date: "Oct 25", price: 2430 },
+      { date: "Nov 25", price: 2480 },
+      { date: "Dec 25", price: 2500 },
+      { date: "Jan 26", price: 2510 },
+      { date: "Feb 26", price: 2530 },
+      { date: "Mar 26", price: 2570 },
+      { date: "Apr 26", price: 2550 },
+      { date: "May 26", price: 2520 },
+      { date: "Jun 26", price: 2540 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 2620, change: 3.1, signal: "up" },
+      { period: "Q4 2026", price: 2695, change: 6.1, signal: "up" },
+      { period: "Q1 2027", price: 2655, change: 4.5, signal: "down" },
+      { period: "Q2 2027", price: 2605, change: 2.5, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "ONGAL26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 2555, expiryDate: "2026-09-16", lotSize: "25 Metric Tons", openInterest: 15400, volume: 2100 }
+    ]
+  },
+  {
+    id: "nickel",
+    name: "Corrosion-Resistant Nickel Alloy",
+    symbol: "NIC-FLOW",
+    currentPrice: 17400,
+    unit: "USD/MT",
+    change24h: 0.95,
+    volatility: "High",
+    history: [
+      { date: "Jul 25", price: 16100 },
+      { date: "Aug 25", price: 16350 },
+      { date: "Sep 25", price: 16700 },
+      { date: "Oct 25", price: 16550 },
+      { date: "Nov 25", price: 16900 },
+      { date: "Dec 25", price: 17020 },
+      { date: "Jan 26", price: 17100 },
+      { date: "Feb 26", price: 17250 },
+      { date: "Mar 26", price: 17500 },
+      { date: "Apr 26", price: 17350 },
+      { date: "May 26", price: 17220 },
+      { date: "Jun 26", price: 17400 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 18050, change: 3.7, signal: "up" },
+      { period: "Q4 2026", price: 18780, change: 7.9, signal: "up" },
+      { period: "Q1 2027", price: 18380, change: 5.6, signal: "down" },
+      { period: "Q2 2027", price: 17850, change: 2.5, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "ONGN26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 17520, expiryDate: "2026-09-16", lotSize: "6 Metric Tons", openInterest: 28500, volume: 3800 }
+    ]
+  }
+];
+
+const OIL_GAS_RISKS = [
+  { country: "India", riskScore: 1.5, status: "Stable", description: "Excellent domestic pipeline seamless tubes & valve mills.", vendorCount: 4, materialShare: 100 }
+];
+
+// 5. MANUFACTURING (Heavy Machinery & Automotive Engines)
+const MANUFACTURING_MATERIALS = [
+  {
+    id: "MAT-MFG01",
+    name: "Industrial CNC Milling structural Steel Frame",
+    category: "Machine Tooling",
+    unitPrice: 45000,
+    currency: "USD",
+    volume: 120,
+    totalValue: 5400000,
+    vendorName: "Ace Micromatic Group",
+    vendorCountry: "India",
+    commodityWeights: { copper: 5, steel: 85, aluminum: 5, nickel: 3, other: 2 },
+    isAiMapped: false,
+    inventoryUsed: 85,
+    inventoryOrdered: 35,
+    inventoryBufferStock: 12
+  },
+  {
+    id: "MAT-MFG02",
+    name: "Engine Drive System Cast Iron Gears Block",
+    category: "Drive Systems",
+    unitPrice: 420,
+    currency: "USD",
+    volume: 15000,
+    totalValue: 6300000,
+    vendorName: "Kirloskar Ferrous Industries",
+    vendorCountry: "India",
+    commodityWeights: { copper: 2, steel: 93, aluminum: 0, nickel: 3, other: 2 },
+    isAiMapped: false,
+    inventoryUsed: 11000,
+    inventoryOrdered: 4000,
+    inventoryBufferStock: 1500
+  },
+  {
+    id: "MAT-MFG03",
+    name: "Heavy-Duty copper Inductor Heating Coil",
+    category: "Heating Systems",
+    unitPrice: 1800,
+    currency: "USD",
+    volume: 2000,
+    totalValue: 3600000,
+    vendorName: "TDK India Private Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 88, steel: 5, aluminum: 5, nickel: 0, other: 2 },
+    isAiMapped: false,
+    inventoryUsed: 1400,
+    inventoryOrdered: 600,
+    inventoryBufferStock: 200
+  },
+  {
+    id: "MAT-MFG04",
+    name: "Pneumatic Aluminum Actuator Cylinder",
+    category: "Motion Control",
+    unitPrice: 290,
+    currency: "USD",
+    volume: 12000,
+    totalValue: 3480000,
+    vendorName: "Festo India Sourcing",
+    vendorCountry: "India",
+    commodityWeights: { copper: 5, steel: 15, aluminum: 75, nickel: 0, other: 5 },
+    isAiMapped: false,
+    inventoryUsed: 9200,
+    inventoryOrdered: 2800,
+    inventoryBufferStock: 1000
+  }
+];
+
+const MANUFACTURING_COMMODITIES = [
+  {
+    id: "copper",
+    name: "Heavy Inductor copper Index",
+    symbol: "IND-COP",
+    currentPrice: 8520,
+    unit: "USD/MT",
+    change24h: 1.55,
+    volatility: "High",
+    history: [
+      { date: "Jul 25", price: 8050 },
+      { date: "Aug 25", price: 8200 },
+      { date: "Sep 25", price: 8260 },
+      { date: "Oct 25", price: 8160 },
+      { date: "Nov 25", price: 8330 },
+      { date: "Dec 25", price: 8390 },
+      { date: "Jan 26", price: 8420 },
+      { date: "Feb 26", price: 8460 },
+      { date: "Mar 26", price: 8540 },
+      { date: "Apr 26", price: 8570 },
+      { date: "May 26", price: 8470 },
+      { date: "Jun 26", price: 8520 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 8750, change: 2.7, signal: "up" },
+      { period: "Q4 2026", price: 9020, change: 5.8, signal: "up" },
+      { period: "Q1 2027", price: 8860, change: 3.9, signal: "down" },
+      { period: "Q2 2027", price: 8720, change: 2.3, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "INDC26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 8540, expiryDate: "2026-09-16", lotSize: "25 Metric Tons", openInterest: 15400, volume: 1850 }
+    ]
+  },
+  {
+    id: "steel",
+    name: "Cast Iron & Tooling Steel Index",
+    symbol: "MACH-ST",
+    currentPrice: 690,
+    unit: "USD/MT",
+    change24h: -1.35,
+    volatility: "Low",
+    history: [
+      { date: "Jul 25", price: 750 },
+      { date: "Aug 25", price: 735 },
+      { date: "Sep 25", price: 720 },
+      { date: "Oct 25", price: 712 },
+      { date: "Nov 25", price: 700 },
+      { date: "Dec 25", price: 695 },
+      { date: "Jan 26", price: 690 },
+      { date: "Feb 26", price: 685 },
+      { date: "Mar 26", price: 695 },
+      { date: "Apr 26", price: 688 },
+      { date: "May 26", price: 682 },
+      { date: "Jun 26", price: 690 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 670, change: -2.8, signal: "down" },
+      { period: "Q4 2026", price: 652, change: -5.5, signal: "down" },
+      { period: "Q1 2027", price: 670, change: -2.8, signal: "up" },
+      { period: "Q2 2027", price: 685, change: -0.7, signal: "up" }
+    ],
+    foContracts: [
+      { symbol: "MCHST26 (Futures)", exchange: "SGE (Shanghai)", contractType: "Futures", currentPrice: 688, expiryDate: "2026-09-15", lotSize: "100 Metric Tons", openInterest: 11000, volume: 1400 }
+    ]
+  },
+  {
+    id: "aluminum",
+    name: "Pneumatic Cylinder Aluminum",
+    symbol: "PNUM-AL",
+    currentPrice: 2360,
+    unit: "USD/MT",
+    change24h: 1.15,
+    volatility: "Medium",
+    history: [
+      { date: "Jul 25", price: 2210 },
+      { date: "Aug 25", price: 2230 },
+      { date: "Sep 25", price: 2270 },
+      { date: "Oct 25", price: 2250 },
+      { date: "Nov 25", price: 2300 },
+      { date: "Dec 25", price: 2320 },
+      { date: "Jan 26", price: 2330 },
+      { date: "Feb 26", price: 2350 },
+      { date: "Mar 26", price: 2390 },
+      { date: "Apr 26", price: 2370 },
+      { date: "May 26", price: 2340 },
+      { date: "Jun 26", price: 2360 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 2440, change: 3.3, signal: "up" },
+      { period: "Q4 2026", price: 2510, change: 6.3, signal: "up" },
+      { period: "Q1 2027", price: 2470, change: 4.6, signal: "down" },
+      { period: "Q2 2027", price: 2420, change: 2.5, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "PNMAL26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 2375, expiryDate: "2026-09-16", lotSize: "25 Metric Tons", openInterest: 15400, volume: 2200 }
+    ]
+  },
+  {
+    id: "nickel",
+    name: "CNC Precision Alloy Elements",
+    symbol: "CNC-ALL",
+    currentPrice: 15900,
+    unit: "USD/MT",
+    change24h: 0.95,
+    volatility: "High",
+    history: [
+      { date: "Jul 25", price: 14700 },
+      { date: "Aug 25", price: 14950 },
+      { date: "Sep 25", price: 15300 },
+      { date: "Oct 25", price: 15150 },
+      { date: "Nov 25", price: 15500 },
+      { date: "Dec 25", price: 15620 },
+      { date: "Jan 26", price: 15700 },
+      { date: "Feb 26", price: 15820 },
+      { date: "Mar 26", price: 16100 },
+      { date: "Apr 26", price: 15950 },
+      { date: "May 26", price: 15780 },
+      { date: "Jun 26", price: 15900 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 16500, change: 3.7, signal: "up" },
+      { period: "Q4 2026", price: 17180, change: 8.0, signal: "up" },
+      { period: "Q1 2027", price: 16800, change: 5.6, signal: "down" },
+      { period: "Q2 2027", price: 16320, change: 2.6, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "CNCA26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 16020, expiryDate: "2026-09-16", lotSize: "6 Metric Tons", openInterest: 18200, volume: 2300 }
+    ]
+  }
+];
+
+const MANUFACTURING_RISKS = [
+  { country: "India", riskScore: 1.5, status: "Stable", description: "Vast tooling and drive component fabrication centers.", vendorCount: 4, materialShare: 100 }
+];
+
+// 6. SOFTWARE (TCS / Cloud Systems & Datacenters)
+const SOFTWARE_MATERIALS = [
+  {
+    id: "MAT-SFT01",
+    name: "Datacenter Core Network copper Power Cords",
+    category: "Cabling Networks",
+    unitPrice: 18,
+    currency: "USD",
+    volume: 150000,
+    totalValue: 2700000,
+    vendorName: "Finolex Cables Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 88, steel: 0, aluminum: 5, nickel: 0, other: 7 },
+    isAiMapped: false,
+    inventoryUsed: 110000,
+    inventoryOrdered: 40000,
+    inventoryBufferStock: 12000
+  },
+  {
+    id: "MAT-SFT02",
+    name: "Blade Server Aluminum Cooling Heatsinks Fin",
+    category: "Storage Hardware",
+    unitPrice: 85,
+    currency: "USD",
+    volume: 80000,
+    totalValue: 6800000,
+    vendorName: "Delta Electronics India",
+    vendorCountry: "India",
+    commodityWeights: { copper: 10, steel: 5, aluminum: 82, nickel: 0, other: 3 },
+    isAiMapped: false,
+    inventoryUsed: 580000,
+    inventoryOrdered: 220000,
+    inventoryBufferStock: 50000
+  },
+  {
+    id: "MAT-SFT03",
+    name: "Data Center Mainframe Rack High-Tensile Steel Frame",
+    category: "Chassis Rails",
+    unitPrice: 380,
+    currency: "USD",
+    volume: 15000,
+    totalValue: 5700000,
+    vendorName: "Netrack Enclosures Pvt Ltd",
+    vendorCountry: "India",
+    commodityWeights: { copper: 2, steel: 92, aluminum: 3, nickel: 1, other: 2 },
+    isAiMapped: false,
+    inventoryUsed: 11000,
+    inventoryOrdered: 4000,
+    inventoryBufferStock: 1000
+  },
+  {
+    id: "MAT-SFT04",
+    name: "Lithium-Nickel Uninterruptible Power Supply (UPS) Cell",
+    category: "Backup Power",
+    unitPrice: 4200,
+    currency: "USD",
+    volume: 2500,
+    totalValue: 10500000,
+    vendorName: "Schneider Electric Sourcing",
+    vendorCountry: "France",
+    commodityWeights: { copper: 15, steel: 10, aluminum: 15, nickel: 55, other: 5 },
+    isAiMapped: false,
+    inventoryUsed: 1900,
+    inventoryOrdered: 600,
+    inventoryBufferStock: 150
+  }
+];
+
+const SOFTWARE_COMMODITIES = [
+  {
+    id: "copper",
+    name: "Infrastructure Power copper Index",
+    symbol: "INF-COP",
+    currentPrice: 8500,
+    unit: "USD/MT",
+    change24h: 1.25,
+    volatility: "High",
+    history: [
+      { date: "Jul 25", price: 8100 },
+      { date: "Aug 25", price: 8250 },
+      { date: "Sep 25", price: 8290 },
+      { date: "Oct 25", price: 8190 },
+      { date: "Nov 25", price: 8350 },
+      { date: "Dec 25", price: 8400 },
+      { date: "Jan 26", price: 8440 },
+      { date: "Feb 26", price: 8470 },
+      { date: "Mar 26", price: 8520 },
+      { date: "Apr 26", price: 8550 },
+      { date: "May 26", price: 8450 },
+      { date: "Jun 26", price: 8500 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 8720, change: 2.5, signal: "up" },
+      { period: "Q4 2026", price: 8990, change: 5.7, signal: "up" },
+      { period: "Q1 2027", price: 8820, change: 3.7, signal: "down" },
+      { period: "Q2 2027", price: 8690, change: 2.2, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "INFCP26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 8515, expiryDate: "2026-09-16", lotSize: "25 Metric Tons", openInterest: 14200, volume: 1800 }
+    ]
+  },
+  {
+    id: "steel",
+    name: "Tensile Rack Steel Index",
+    symbol: "RAK-ST",
+    currentPrice: 710,
+    unit: "USD/MT",
+    change24h: -1.15,
+    volatility: "Low",
+    history: [
+      { date: "Jul 25", price: 770 },
+      { date: "Aug 25", price: 755 },
+      { date: "Sep 25", price: 740 },
+      { date: "Oct 25", price: 732 },
+      { date: "Nov 25", price: 720 },
+      { date: "Dec 25", price: 715 },
+      { date: "Jan 26", price: 710 },
+      { date: "Feb 26", price: 705 },
+      { date: "Mar 26", price: 715 },
+      { date: "Apr 26", price: 708 },
+      { date: "May 26", price: 702 },
+      { date: "Jun 26", price: 710 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 690, change: -2.8, signal: "down" },
+      { period: "Q4 2026", price: 672, change: -5.3, signal: "down" },
+      { period: "Q1 2027", price: 690, change: -2.8, signal: "up" },
+      { period: "Q2 2027", price: 705, change: -0.7, signal: "up" }
+    ],
+    foContracts: [
+      { symbol: "RKST26 (Futures)", exchange: "SGE (Shanghai)", contractType: "Futures", currentPrice: 708, expiryDate: "2026-09-15", lotSize: "100 Metric Tons", openInterest: 8400, volume: 1100 }
+    ]
+  },
+  {
+    id: "aluminum",
+    name: "Blade Server cooling Aluminum",
+    symbol: "BLD-AL",
+    currentPrice: 2280,
+    unit: "USD/MT",
+    change24h: 0.95,
+    volatility: "Medium",
+    history: [
+      { date: "Jul 25", price: 2150 },
+      { date: "Aug 25", price: 2170 },
+      { date: "Sep 25", price: 2210 },
+      { date: "Oct 25", price: 2190 },
+      { date: "Nov 25", price: 2230 },
+      { date: "Dec 25", price: 2250 },
+      { date: "Jan 26", price: 2260 },
+      { date: "Feb 26", price: 2270 },
+      { date: "Mar 26", price: 2310 },
+      { date: "Apr 26", price: 2290 },
+      { date: "May 26", price: 2260 },
+      { date: "Jun 26", price: 2280 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 2350, change: 3.0, signal: "up" },
+      { period: "Q4 2026", price: 2420, change: 6.1, signal: "up" },
+      { period: "Q1 2027", price: 2380, change: 4.3, signal: "down" },
+      { period: "Q2 2027", price: 2330, change: 2.1, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "BLDAL26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 2290, expiryDate: "2026-09-16", lotSize: "25 Metric Tons", openInterest: 11500, volume: 1600 }
+    ]
+  },
+  {
+    id: "nickel",
+    name: "UPS Battery Nickel Core Index",
+    symbol: "UPS-NIC",
+    currentPrice: 15600,
+    unit: "USD/MT",
+    change24h: 1.05,
+    volatility: "High",
+    history: [
+      { date: "Jul 25", price: 14400 },
+      { date: "Aug 25", price: 14650 },
+      { date: "Sep 25", price: 15000 },
+      { date: "Oct 25", price: 14850 },
+      { date: "Nov 25", price: 15200 },
+      { date: "Dec 25", price: 15320 },
+      { date: "Jan 26", price: 15400 },
+      { date: "Feb 26", price: 15520 },
+      { date: "Mar 26", price: 15800 },
+      { date: "Apr 26", price: 15650 },
+      { date: "May 26", price: 15480 },
+      { date: "Jun 26", price: 15600 }
+    ],
+    forecast: [
+      { period: "Q3 2026", price: 16200, change: 3.8, signal: "up" },
+      { period: "Q4 2026", price: 16900, change: 8.3, signal: "up" },
+      { period: "Q1 2027", price: 16500, change: 5.7, signal: "down" },
+      { period: "Q2 2027", price: 16000, change: 2.5, signal: "down" }
+    ],
+    foContracts: [
+      { symbol: "UPSN26 (Futures)", exchange: "LME (London)", contractType: "Futures", currentPrice: 15720, expiryDate: "2026-09-16", lotSize: "6 Metric Tons", openInterest: 16200, volume: 2200 }
+    ]
+  }
+];
+
+const SOFTWARE_RISKS = [
+  { country: "India", riskScore: 1.5, status: "Stable", description: "Excellent high-volume secure structural and cabling vendor network.", vendorCount: 3, materialShare: 59 },
+  { country: "France", riskScore: 2.0, status: "Stable", description: "Safe and compliant high-tech battery backup power fabrication center.", vendorCount: 1, materialShare: 41 }
+];
 
 const getExcelPath = (industry: string) => {
-  if (industry === "pharma") return PHARMA_EXCEL_PATH;
-  if (industry === "retail") return RETAIL_EXCEL_PATH;
-  return AUTOMOBILE_EXCEL_PATH;
+  return path.join(DATA_DIR, `sap_${industry}.xlsx`);
 };
 
 const getDefaults = (industry: string) => {
@@ -868,10 +2305,23 @@ const getDefaults = (industry: string) => {
     return { materials: PHARMA_MATERIALS, commodities: PHARMA_COMMODITIES, risks: PHARMA_RISKS };
   } else if (industry === "retail") {
     return { materials: RETAIL_MATERIALS, commodities: RETAIL_COMMODITIES, risks: RETAIL_RISKS };
+  } else if (industry === "telecom") {
+    return { materials: TELECOM_MATERIALS, commodities: TELECOM_COMMODITIES, risks: TELECOM_RISKS };
+  } else if (industry === "finance") {
+    return { materials: FINANCE_MATERIALS, commodities: FINANCE_COMMODITIES, risks: FINANCE_RISKS };
+  } else if (industry === "banks") {
+    return { materials: BANKS_MATERIALS, commodities: BANKS_COMMODITIES, risks: BANKS_RISKS };
+  } else if (industry === "oil_gas") {
+    return { materials: OIL_GAS_MATERIALS, commodities: OIL_GAS_COMMODITIES, risks: OIL_GAS_RISKS };
+  } else if (industry === "manufacturing") {
+    return { materials: MANUFACTURING_MATERIALS, commodities: MANUFACTURING_COMMODITIES, risks: MANUFACTURING_RISKS };
+  } else if (industry === "software") {
+    return { materials: SOFTWARE_MATERIALS, commodities: SOFTWARE_COMMODITIES, risks: SOFTWARE_RISKS };
   } else {
     return { materials: INITIAL_MATERIALS, commodities: INITIAL_COMMODITIES, risks: GEOPOLITICAL_RISKS_MOCK };
   }
 };
+
 
 function writeExcelData(filePath: string, materials: any[], commodities: any[], risks: any[]) {
   const wb = XLSX.utils.book_new();
@@ -962,15 +2412,24 @@ function readExcelData(filePath: string, defaultMaterials: any[], defaultCommodi
 }
 
 // Bootstrap physical Excel database files on startup
-if (!fs.existsSync(AUTOMOBILE_EXCEL_PATH)) {
-  writeExcelData(AUTOMOBILE_EXCEL_PATH, INITIAL_MATERIALS, INITIAL_COMMODITIES, GEOPOLITICAL_RISKS_MOCK);
-}
-if (!fs.existsSync(PHARMA_EXCEL_PATH)) {
-  writeExcelData(PHARMA_EXCEL_PATH, PHARMA_MATERIALS, PHARMA_COMMODITIES, PHARMA_RISKS);
-}
-if (!fs.existsSync(RETAIL_EXCEL_PATH)) {
-  writeExcelData(RETAIL_EXCEL_PATH, RETAIL_MATERIALS, RETAIL_COMMODITIES, RETAIL_RISKS);
-}
+const industriesToBootstrap = [
+  { id: "automobile", m: INITIAL_MATERIALS, c: INITIAL_COMMODITIES, r: GEOPOLITICAL_RISKS_MOCK },
+  { id: "pharma", m: PHARMA_MATERIALS, c: PHARMA_COMMODITIES, r: PHARMA_RISKS },
+  { id: "retail", m: RETAIL_MATERIALS, c: RETAIL_COMMODITIES, r: RETAIL_RISKS },
+  { id: "telecom", m: TELECOM_MATERIALS, c: TELECOM_COMMODITIES, r: TELECOM_RISKS },
+  { id: "finance", m: FINANCE_MATERIALS, c: FINANCE_COMMODITIES, r: FINANCE_RISKS },
+  { id: "banks", m: BANKS_MATERIALS, c: BANKS_COMMODITIES, r: BANKS_RISKS },
+  { id: "oil_gas", m: OIL_GAS_MATERIALS, c: OIL_GAS_COMMODITIES, r: OIL_GAS_RISKS },
+  { id: "manufacturing", m: MANUFACTURING_MATERIALS, c: MANUFACTURING_COMMODITIES, r: MANUFACTURING_RISKS },
+  { id: "software", m: SOFTWARE_MATERIALS, c: SOFTWARE_COMMODITIES, r: SOFTWARE_RISKS }
+];
+
+industriesToBootstrap.forEach(ind => {
+  const filePath = getExcelPath(ind.id);
+  if (!fs.existsSync(filePath)) {
+    writeExcelData(filePath, ind.m, ind.c, ind.r);
+  }
+});
 
 const getLocalStrategyMemo = (materials: any[], simulatedRates: any, industry: string = "automobile") => {
   const rates = {
@@ -1245,7 +2704,8 @@ app.get("/api/geopolitical-risks", (req, res) => {
 
 // 4. Get Excel File DB Details (Information/Metadata)
 app.get("/api/excel/info", (req, res) => {
-  const industries = ["automobile", "pharma", "retail"];
+  const sysConfig = loadSystemConfig();
+  const industries = sysConfig.industries.map(i => i.id);
   const info = industries.map(ind => {
     const filePath = getExcelPath(ind);
     const relativePath = path.relative(process.cwd(), filePath);
@@ -1260,6 +2720,18 @@ app.get("/api/excel/info", (req, res) => {
     };
   });
   res.json(info);
+});
+
+// New endpoint: Expose list of industries with display names dynamically
+app.get("/api/industries", (req, res) => {
+  const sysConfig = loadSystemConfig();
+  const list = sysConfig.industries.map(i => ({
+    id: i.id,
+    name: i.name,
+    clientName: i.clientName,
+    sectorName: i.sectorName
+  }));
+  res.json(list);
 });
 
 // 5. Save updated materials dataset directly back to Excel
@@ -1309,6 +2781,242 @@ app.post("/api/excel/update-risks", (req, res) => {
     res.json({ success: true, message: `Successfully updated risks in Excel file: ${filePath}` });
   } catch (err: any) {
     console.error(`[EXCEL] Error updating risks in ${filePath}:`, err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Live FX and Commodity price background fluctuation ticker
+const initialConfig = loadSystemConfig();
+let liveFxRates = { 
+  USD_INR: initialConfig.variables.USD_INR_DEFAULT || 83.45, 
+  USD_EUR: initialConfig.variables.USD_EUR_DEFAULT || 0.92, 
+  source: "Default Rates from system_config.xlsx" 
+};
+let lastFxFetchTime = "Never";
+let tickerIntervalCount = 0;
+
+// Fetch live FX rates from configured public endpoint
+async function fetchLiveRates() {
+  const sysConfig = loadSystemConfig();
+  const url = sysConfig.variables.FX_API_URL || "https://open.er-api.com/v6/latest/USD";
+  const defaultInr = sysConfig.variables.USD_INR_DEFAULT || 83.45;
+  const defaultEur = sysConfig.variables.USD_EUR_DEFAULT || 0.9200;
+
+  try {
+    console.log(`[LIVE-API] Fetching real-time exchange rates from ${url}...`);
+    const response = await fetch(url);
+    if (response.ok) {
+      const data = await response.json();
+      if (data && data.rates) {
+        liveFxRates = {
+          USD_INR: Number((data.rates.INR || defaultInr).toFixed(2)),
+          USD_EUR: Number((data.rates.EUR || defaultEur).toFixed(4)),
+          source: `Live Feed from ${new URL(url).hostname}`
+        };
+        lastFxFetchTime = new Date().toLocaleTimeString();
+        console.log(`[LIVE-API] Successfully synchronized FX: USD/INR = ${liveFxRates.USD_INR}, Source: ${liveFxRates.source}`);
+      }
+    } else {
+      console.warn(`[LIVE-API] Server returned error status: ${response.status}`);
+    }
+  } catch (err: any) {
+    console.warn(`[LIVE-API] Could not fetch live rates: ${err.message || err}. Using default template FX.`);
+  }
+}
+
+// Background simulation ticker that rewrites Excel files on disk
+function fluctuateAllExcelDatabases() {
+  const sysConfig = loadSystemConfig();
+  const industries = sysConfig.industries.map(i => i.id);
+  const maxFlucPct = sysConfig.variables.MAX_FLUC_PCT || 1.5;
+  const minPrice = sysConfig.variables.MIN_COMMODITY_PRICE || 10;
+  const maxPrice = sysConfig.variables.MAX_COMMODITY_PRICE || 100000;
+
+  tickerIntervalCount++;
+  console.log(`[TICKER] Tick #${tickerIntervalCount} - Simulating global commodity changes on disk (Max +/- ${maxFlucPct}%)...`);
+  
+  industries.forEach(ind => {
+    const defaults = getDefaults(ind);
+    const filePath = getExcelPath(ind);
+    
+    try {
+      if (!fs.existsSync(filePath)) {
+        // If file doesn't exist, bootstrap it first
+        writeExcelData(filePath, defaults.materials, defaults.commodities, defaults.risks);
+      }
+      
+      const data = readExcelData(filePath, defaults.materials, defaults.commodities, defaults.risks);
+      
+      // 1. Fluctuate each commodity price slightly
+      const updatedCommodities = data.commodities.map((c: any) => {
+        // Simulating 24-hour fluctuations with random walk (+/- maxFlucPct)
+        const range = maxFlucPct * 2;
+        const fluctuationPercent = (Math.random() * range - maxFlucPct) / 100;
+        const oldPrice = c.currentPrice || 1000;
+        let newPrice = oldPrice * (1 + fluctuationPercent);
+        
+        // Boundaries to keep numbers realistic (configured from excel)
+        if (newPrice < minPrice) newPrice = minPrice;
+        if (newPrice > maxPrice) newPrice = maxPrice;
+        
+        const deltaPercent = ((newPrice - oldPrice) / oldPrice) * 100;
+        const change24h = (c.change24h || 0) + deltaPercent;
+        
+        // Keep a neat rolling history
+        let history = c.history;
+        if (!Array.isArray(history)) {
+          try {
+            history = typeof history === "string" ? JSON.parse(history) : [];
+          } catch (e) {
+            history = [];
+          }
+        }
+        
+        const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        history.push({ date: timestamp, price: Number(newPrice.toFixed(2)) });
+        if (history.length > 10) history.shift();
+        
+        return {
+          ...c,
+          currentPrice: Number(newPrice.toFixed(2)),
+          change24h: Number(change24h.toFixed(2)),
+          history
+        };
+      });
+      
+      // 2. Propagate price changes down to S/4HANA material master prices proportionally based on weights
+      const updatedMaterials = data.materials.map((m: any) => {
+        const weights = m.commodityWeights || {};
+        
+        // Base weights influence
+        let weightSum = 0;
+        let weightedPriceSum = 0;
+        
+        Object.keys(weights).forEach(key => {
+          if (key === "other") return;
+          const wt = weights[key] || 0;
+          const comm = updatedCommodities.find((c: any) => c.id === key);
+          if (comm) {
+            weightedPriceSum += (wt * comm.currentPrice);
+            weightSum += wt;
+          }
+        });
+        
+        // Scale unit price using weighted commodity changes
+        const originalDefaults = defaults.materials.find((dm: any) => dm.id === m.id);
+        const basePrice = originalDefaults ? originalDefaults.unitPrice : m.unitPrice;
+        
+        // Random walk of material price combined with currency fluctuation
+        const randomFactor = 1 + (Math.random() * 0.4 - 0.2) / 100; // tiny +/- 0.2% randomness
+        const fxFactor = liveFxRates.USD_INR / (sysConfig.variables.USD_INR_DEFAULT || 83.45); // currency impact
+        
+        let calculatedPrice = basePrice * randomFactor * fxFactor;
+        
+        // If there's a strong commodity link, we influence it up to 40%
+        if (weightSum > 0) {
+          const pctInfluence = Math.min(weightSum / 100, 0.6); // cap commodity weight influence
+          calculatedPrice = (basePrice * (1 - pctInfluence)) + (basePrice * pctInfluence * (weightedPriceSum / 5000)); // blended ratio
+        }
+        
+        if (calculatedPrice < 1) calculatedPrice = 1;
+        
+        return {
+          ...m,
+          unitPrice: Number(calculatedPrice.toFixed(2)),
+          totalValue: Number((calculatedPrice * (m.volume || 0)).toFixed(2))
+        };
+      });
+      
+      // Write back directly to disk
+      writeExcelData(filePath, updatedMaterials, updatedCommodities, data.risks);
+      
+    } catch (err: any) {
+      console.error(`[TICKER] Error updating database for industry ${ind}:`, err.message || err);
+    }
+  });
+  
+  console.log(`[TICKER] Rewrite completed for all Excel spreadsheets on disk.`);
+}
+
+// Master Interval checking system_config.xlsx parameters dynamically every second
+let fxElapsedSeconds = 0;
+let tickerElapsedSeconds = 0;
+
+// Execute initial rate sync
+fetchLiveRates();
+setTimeout(fluctuateAllExcelDatabases, 2000);
+
+setInterval(() => {
+  const sysConfig = loadSystemConfig();
+  const tickerSec = sysConfig.variables.TICKER_INTERVAL_SEC || 60;
+  const fxMin = sysConfig.variables.FX_REFRESH_INTERVAL_MIN || 5;
+  const fxSec = fxMin * 60;
+
+  fxElapsedSeconds++;
+  tickerElapsedSeconds++;
+
+  if (tickerElapsedSeconds >= tickerSec) {
+    tickerElapsedSeconds = 0;
+    fluctuateAllExcelDatabases();
+  }
+
+  if (fxElapsedSeconds >= fxSec) {
+    fxElapsedSeconds = 0;
+    fetchLiveRates();
+  }
+}, 1000);
+
+// API endpoint to retrieve full system_config.xlsx specifications
+app.get("/api/system-config", (req, res) => {
+  try {
+    const config = loadSystemConfig();
+    res.json(config);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API endpoint to update variables sheet in system_config.xlsx dynamically
+app.post("/api/system-config/update-variables", (req, res) => {
+  const { variables } = req.body;
+  if (!variables || typeof variables !== "object") {
+    return res.status(400).json({ error: "Missing variables object in request body" });
+  }
+  try {
+    saveSystemConfigVariables(variables);
+    res.json({
+      success: true,
+      message: "Variables successfully synchronized with system_config.xlsx on server!"
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 8. Live market fluctuation status
+app.get("/api/ticker-status", (req, res) => {
+  res.json({
+    activeFxRate: liveFxRates.USD_INR,
+    eurRate: liveFxRates.USD_EUR,
+    source: liveFxRates.source,
+    lastFetch: lastFxFetchTime,
+    ticks: tickerIntervalCount,
+    lastUpdate: new Date().toLocaleTimeString(),
+    nextUpdateInSeconds: 60 - Math.floor((Date.now() % 60000) / 1000)
+  });
+});
+
+// 9. Manual trigger for immediate fluctuation
+app.post("/api/trigger-fluctuation", (req, res) => {
+  try {
+    fluctuateAllExcelDatabases();
+    res.json({
+      success: true,
+      message: "Market price fluctuations triggered successfully! All 9 physical Excel databases updated on disk.",
+      activeFxRate: liveFxRates.USD_INR,
+      lastUpdate: new Date().toLocaleTimeString()
+    });
+  } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
